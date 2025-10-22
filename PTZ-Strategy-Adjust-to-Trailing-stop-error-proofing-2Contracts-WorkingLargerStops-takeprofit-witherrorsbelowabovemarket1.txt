@@ -200,6 +200,12 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 			try
 			{
+				if (Position.MarketPosition != MarketPosition.Flat && GetCurrentBidPrice() <= 0 && GetCurrentAskPrice() <= 0)
+				{
+					Print(string.Format("{0}: WARNING - Invalid bid/ask data while in position", Time[0]));
+					return;
+				}
+
 				// Reset daily P&L tracking on new day
 				if (Time[0].Date != currentTradingDate.Date)
 				{
@@ -216,6 +222,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 					{
 						Print(string.Format("{0}: Daily limit reached. No new trades today. Daily P&L: {1:C}", Time[0], dailyPnL));
 						dailyLimitReached = true;
+
+						CloseAllPositionsOnError("Daily limit reached");
 					}
 					return;
 				}
@@ -1059,12 +1067,21 @@ namespace NinjaTrader.NinjaScript.Strategies
 					}
 				}
 
+				double currentBid = GetCurrentBidPrice();
+				double currentAsk = GetCurrentAskPrice();
+
+				if (currentBid <= 0 || currentAsk <= 0)
+				{
+					Print(string.Format("{0}: Skipping stop update - invalid bid/ask", Time[0]));
+					return;
+				}
+
 				double currentPrice = Close[0];
 				double unrealizedProfitTicks = 0;
 
 				if (Position.MarketPosition == MarketPosition.Long)
 				{
-					unrealizedProfitTicks = (currentPrice - Position.AveragePrice) / TickSize;
+					unrealizedProfitTicks = (currentBid - Position.AveragePrice) / TickSize;
 
 					if (!EnableMultiContract || Position.Quantity == 1)
 					{
@@ -1080,7 +1097,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 				}
 				else if (Position.MarketPosition == MarketPosition.Short)
 				{
-					unrealizedProfitTicks = (Position.AveragePrice - currentPrice) / TickSize;
+					unrealizedProfitTicks = (Position.AveragePrice - currentAsk) / TickSize;
 
 					if (!EnableMultiContract || Position.Quantity == 1)
 					{
@@ -1098,6 +1115,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 			catch (Exception ex)
 			{
 				Print(string.Format("{0}: ERROR managing trailing stop: {1}", Time[0], ex.Message));
+				CloseAllPositionsOnError("Trailing stop management error");
 			}
 		}
 
@@ -1141,7 +1159,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 					{
 						trailDistance = Math.Max(
 							(Position.AveragePrice * PercentageTrailOffset / 100.0) / TickSize,
-							MinimumStopDistanceTicks
+							MinimumStopDistanceTicks + 3
 						);
 					}
 					else
@@ -1155,7 +1173,15 @@ namespace NinjaTrader.NinjaScript.Strategies
 					}
 
 					double currentBid = GetCurrentBidPrice();
+					double maxAllowedStop = currentBid - ((MinimumStopDistanceTicks + 2) * TickSize);
 					double newStopPrice = currentBid - (trailDistance * TickSize);
+
+					if (newStopPrice > maxAllowedStop)
+					{
+						Print(string.Format("{0}: LONG stop calculation too close to bid - skipping update (calculated: {1:F2}, max: {2:F2})",
+							Time[0], newStopPrice, maxAllowedStop));
+						return;
+					}
 
 					if (trailStopPrice[contractIndex] == 0 || newStopPrice > trailStopPrice[contractIndex])
 					{
@@ -1182,7 +1208,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 					{
 						trailDistance = Math.Max(
 							(Position.AveragePrice * PercentageTrailOffset / 100.0) / TickSize,
-							MinimumStopDistanceTicks
+							MinimumStopDistanceTicks + 3
 						);
 					}
 					else
@@ -1196,7 +1222,15 @@ namespace NinjaTrader.NinjaScript.Strategies
 					}
 
 					double currentAsk = GetCurrentAskPrice();
+					double minAllowedStop = currentAsk + ((MinimumStopDistanceTicks + 2) * TickSize);
 					double newStopPrice = currentAsk + (trailDistance * TickSize);
+
+					if (newStopPrice < minAllowedStop)
+					{
+						Print(string.Format("{0}: SHORT stop calculation too close to ask - skipping update (calculated: {1:F2}, min: {2:F2})",
+							Time[0], newStopPrice, minAllowedStop));
+						return;
+					}
 
 					if (trailStopPrice[contractIndex] == 0 || newStopPrice < trailStopPrice[contractIndex])
 					{
@@ -1230,7 +1264,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 				if (position == MarketPosition.Short)
 				{
-					double minAllowedStop = currentAsk + (MinimumStopDistanceTicks * TickSize);
+					double minAllowedStop = currentAsk + ((MinimumStopDistanceTicks + 2) * TickSize);
 
 					if (stopPrice >= minAllowedStop)
 					{
@@ -1238,14 +1272,15 @@ namespace NinjaTrader.NinjaScript.Strategies
 					}
 					else
 					{
-						Print(string.Format("{0}: SHORT stop {1:F2} invalid - must be >= {2:F2} (Ask: {3:F2} + {4} ticks)",
-							Time[0], stopPrice, minAllowedStop, currentAsk, MinimumStopDistanceTicks));
+						Print(string.Format("{0}: SHORT stop {1:F2} REJECTED - must be >= {2:F2} (Ask: {3:F2} + {4} ticks)",
+							Time[0], stopPrice, minAllowedStop, currentAsk, MinimumStopDistanceTicks + 2));
+						CloseAllPositionsOnError("SHORT stop below ask - invalid");
 						return false;
 					}
 				}
 				else if (position == MarketPosition.Long)
 				{
-					double maxAllowedStop = currentBid - (MinimumStopDistanceTicks * TickSize);
+					double maxAllowedStop = currentBid - ((MinimumStopDistanceTicks + 2) * TickSize);
 
 					if (stopPrice <= maxAllowedStop)
 					{
@@ -1253,8 +1288,9 @@ namespace NinjaTrader.NinjaScript.Strategies
 					}
 					else
 					{
-						Print(string.Format("{0}: LONG stop {1:F2} invalid - must be <= {2:F2} (Bid: {3:F2} - {4} ticks)",
-							Time[0], stopPrice, maxAllowedStop, currentBid, MinimumStopDistanceTicks));
+						Print(string.Format("{0}: LONG stop {1:F2} REJECTED - must be <= {2:F2} (Bid: {3:F2} - {4} ticks)",
+							Time[0], stopPrice, maxAllowedStop, currentBid, MinimumStopDistanceTicks + 2));
+						CloseAllPositionsOnError("LONG stop above bid - invalid");
 						return false;
 					}
 				}
@@ -1268,10 +1304,12 @@ namespace NinjaTrader.NinjaScript.Strategies
 					}
 					catch (Exception setStopEx)
 					{
-						Print(string.Format("{0}: SetStopLoss REJECTED - Price: {1:F2}, Position: {2}, Error: {3}",
+						Print(string.Format("{0}: *** SetStopLoss REJECTED BY NINJATRADER *** - Price: {1:F2}, Position: {2}, Error: {3}",
 							Time[0], stopPrice, position, setStopEx.Message));
+						Print(string.Format("{0}: Market state - Bid: {1:F2}, Ask: {2:F2}, Close: {3:F2}",
+							Time[0], currentBid, currentAsk, currentPrice));
 
-						CloseAllPositionsOnError("Stop order rejected");
+						CloseAllPositionsOnError("Stop order rejected by NT");
 						return false;
 					}
 				}
@@ -1322,15 +1360,28 @@ namespace NinjaTrader.NinjaScript.Strategies
 			{
 				if (Position.MarketPosition != MarketPosition.Flat)
 				{
-					Print(string.Format("{0}: CLOSING ALL POSITIONS - Reason: {1}", Time[0], reason));
+					Print(string.Format("{0}: *** EMERGENCY CLOSE *** - Reason: {1}", Time[0], reason));
+					Print(string.Format("{0}: Position Details - {1} {2} contracts at {3:F2}",
+						Time[0], Position.MarketPosition, Position.Quantity, Position.AveragePrice));
+
+					try
+					{
+						SetStopLoss("", CalculationMode.Price, 0, false);
+						SetProfitTarget("", CalculationMode.Price, 0);
+					}
+					catch
+					{
+					}
 
 					if (Position.MarketPosition == MarketPosition.Long)
 					{
-						ExitLong();
+						ExitLong("Emergency Exit Long");
+						Print(string.Format("{0}: Issued ExitLong() market order", Time[0]));
 					}
 					else if (Position.MarketPosition == MarketPosition.Short)
 					{
-						ExitShort();
+						ExitShort("Emergency Exit Short");
+						Print(string.Format("{0}: Issued ExitShort() market order", Time[0]));
 					}
 
 					for (int i = 0; i < trailStopPrice.Length; i++)
@@ -1341,11 +1392,13 @@ namespace NinjaTrader.NinjaScript.Strategies
 					}
 
 					stopOrderRetryCount = 0;
+
+					Print(string.Format("{0}: All positions closed, stops cleared", Time[0]));
 				}
 			}
 			catch (Exception ex)
 			{
-				Print(string.Format("{0}: ERROR closing positions: {1}", Time[0], ex.Message));
+				Print(string.Format("{0}: *** CRITICAL ERROR closing positions: {1} ***", Time[0], ex.Message));
 			}
 		}
 
